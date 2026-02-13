@@ -6,7 +6,7 @@
 --  Schema
 -- ═══════════════════════════════════════════
 
-CREATE SCHEMA IF NOT EXISTS mqtt_pub;
+CREATE SCHEMA mqtt_pub;
 
 -- ═══════════════════════════════════════════
 --  Outbox Table (Cold Path — WAL-durable)

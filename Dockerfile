@@ -22,9 +22,6 @@ COPY sql/ ./sql/
 # Build and install the extension
 RUN make clean && make && make install
 
-# Copy initialization script to run on container startup
-COPY test/init.sql /docker-entrypoint-initdb.d/01-init.sql
-
 # Clean up build directory and return to root
 WORKDIR /
 RUN rm -rf /build/pg_mqtt_pub

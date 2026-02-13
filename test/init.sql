@@ -1,13 +1,10 @@
 -- PostgreSQL initialization script for pg_mqtt_pub Docker environment
+-- Runs via init container after PostgreSQL is ready
 
--- Create pg_mqtt_pub database
-CREATE DATABASE pg_mqtt_pub;
-
--- Setup testdb
+-- Setup testdb (default database) - create extensions here
+\c testdb
 CREATE EXTENSION IF NOT EXISTS pg_cron;
-CREATE EXTENSION IF NOT EXISTS pg_mqtt_pub;
+DROP SCHEMA IF EXISTS mqtt_pub CASCADE;
+CREATE EXTENSION pg_mqtt_pub;
 
--- Setup pg_mqtt_pub database
-\c pg_mqtt_pub
-CREATE EXTENSION IF NOT EXISTS pg_cron;
-CREATE EXTENSION IF NOT EXISTS pg_mqtt_pub;
+\echo 'Extensions installed successfully in testdb!'

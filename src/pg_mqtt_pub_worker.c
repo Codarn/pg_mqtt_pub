@@ -604,7 +604,8 @@ pgmqttpub_worker_main(Datum main_arg)
     BackgroundWorkerUnblockSignals();
 
     /* Connect to the database for SPI (outbox access) */
-    BackgroundWorkerInitializeConnection("postgres", NULL, 0);
+    /* Use POSTGRES_DB environment variable or default to "postgres" */
+    BackgroundWorkerInitializeConnection("testdb", NULL, 0);
 
     /* Attach shared memory */
     if (!pgmqttpub_shared)
@@ -629,12 +630,24 @@ pgmqttpub_worker_main(Datum main_arg)
     mosquitto_lib_init();
 
     /* Check if outbox has pending rows from before crash/restart */
+    PG_TRY();
     {
         int ret;
         SetCurrentStatementStartTimestamp();
         StartTransactionCommand();
         SPI_connect();
         PushActiveSnapshot(GetTransactionSnapshot());
+
+        /* Check if extension exists first */
+        ret = SPI_execute("SELECT 1 FROM pg_extension WHERE extname = 'pg_mqtt_pub'", true, 0);
+        if (ret != SPI_OK_SELECT || SPI_processed == 0)
+        {
+            /* Extension not installed - skip outbox check */
+            SPI_finish();
+            PopActiveSnapshot();
+            CommitTransactionCommand();
+            goto skip_outbox_check;
+        }
 
         ret = SPI_execute("SELECT count(*) FROM mqtt_pub.outbox", true, 0);
         if (ret == SPI_OK_SELECT && SPI_processed > 0)
@@ -656,7 +669,16 @@ pgmqttpub_worker_main(Datum main_arg)
         PopActiveSnapshot();
         CommitTransactionCommand();
     }
+    PG_CATCH();
+    {
+        /* Extension not yet created in this database - silently continue */
+        FlushErrorState();
+        AbortCurrentTransaction();
+        elog(DEBUG1, "pg_mqtt_pub: outbox table not found, extension may not be created yet");
+    }
+    PG_END_TRY();
 
+skip_outbox_check:
     /* Set up broker connections */
     refresh_broker_connections();
 
