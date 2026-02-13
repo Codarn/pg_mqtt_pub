@@ -37,6 +37,7 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
@@ -412,6 +413,28 @@ drain_outbox(void)
     int  i;
     char query[512];
 
+    /* Collect message info BEFORE any DML to avoid SPI cursor invalidation */
+    typedef struct {
+        int64 id;
+        char broker_name[PGMQTTPUB_MAX_BROKER_NAME];
+        char topic[PGMQTTPUB_MAX_TOPIC_LEN];
+        bool success;
+        int attempts;
+    } MessageInfo;
+    MessageInfo *messages = NULL;
+    int num_messages = 0;
+
+    /* Create a child memory context for this call to avoid accumulating memory
+     * in the long-running worker loop. All allocations will be automatically
+     * freed when we reset this context at the end. */
+    MemoryContext drain_context = AllocSetContextCreate(
+        CurrentMemoryContext,
+        "drain_outbox",
+        ALLOCSET_DEFAULT_MINSIZE,
+        ALLOCSET_DEFAULT_INITSIZE,
+        ALLOCSET_DEFAULT_MAXSIZE);
+    MemoryContext oldctx = MemoryContextSwitchTo(drain_context);
+
     SetCurrentStatementStartTimestamp();
     StartTransactionCommand();
     SPI_connect();
@@ -422,11 +445,10 @@ drain_outbox(void)
              "FROM mqtt_pub.outbox "
              "WHERE next_retry_at <= now() "
              "ORDER BY id "
-             "LIMIT %d "
-             "FOR UPDATE SKIP LOCKED",
+             "LIMIT %d",
              pgmqttpub_outbox_batch_size);
 
-    ret = SPI_execute(query, false, 0);  // false = not read-only (FOR UPDATE acquires locks)
+    ret = SPI_execute(query, true, 0);
     processed = SPI_processed;
 
     if (ret != SPI_OK_SELECT || processed == 0)
@@ -434,9 +456,18 @@ drain_outbox(void)
         SPI_finish();
         PopActiveSnapshot();
         CommitTransactionCommand();
+
+        /* Clean up memory context before returning */
+        MemoryContextSwitchTo(oldctx);
+        MemoryContextReset(drain_context);
         return 0;
     }
 
+    /* Allocate memory for message results */
+    messages = palloc(processed * sizeof(MessageInfo));
+    num_messages = processed;
+
+    /* Process each message and collect results */
     for (i = 0; i < processed; i++)
     {
         HeapTuple   tuple = SPI_tuptable->vals[i];
@@ -454,29 +485,51 @@ drain_outbox(void)
         void  *payload_data = VARDATA_ANY(payload_b);
         int    payload_len  = VARSIZE_ANY_EXHDR(payload_b);
 
+        /* Try to publish message */
         bool ok = publish_to_broker(broker_name, topic, payload_data,
                                      payload_len, qos, retain);
 
+        /* Store result for later processing */
+        messages[i].id = id;
+        strlcpy(messages[i].broker_name, broker_name, PGMQTTPUB_MAX_BROKER_NAME);
+        strlcpy(messages[i].topic, topic, PGMQTTPUB_MAX_TOPIC_LEN);
+        messages[i].success = ok;
+        messages[i].attempts = attempts;
+
         if (ok)
+            published++;
+    }
+
+    SPI_finish();
+    PopActiveSnapshot();
+    CommitTransactionCommand();
+
+    /* NOW do the DML operations after we've finished with the SELECT cursor */
+    for (i = 0; i < num_messages; i++)
+    {
+        SetCurrentStatementStartTimestamp();
+        StartTransactionCommand();
+        SPI_connect();
+        PushActiveSnapshot(GetTransactionSnapshot());
+
+        if (messages[i].success)
         {
-            /* Success — delete from outbox */
+            /* Delete successful messages */
             char dml[128];
             snprintf(dml, sizeof(dml),
-                     "DELETE FROM mqtt_pub.outbox WHERE id = %ld", (long)id);
+                     "DELETE FROM mqtt_pub.outbox WHERE id = %ld", (long)messages[i].id);
             SPI_execute(dml, false, 0);
             pg_atomic_fetch_sub_u64(&pgmqttpub_shared->outbox_pending, 1);
-            published++;
         }
         else
         {
-            int new_attempts = attempts + 1;
+            int new_attempts = messages[i].attempts + 1;
 
             if (new_attempts >= pgmqttpub_poison_max_attempts)
             {
-                /* ── Dead-letter the message ── */
+                /* Dead-letter the message */
                 char dml[512];
-                PgMqttPubBrokerState *bs;
-                BrokerHandle *h = find_handle_for_broker(broker_name);
+                BrokerHandle *h = find_handle_for_broker(messages[i].broker_name);
 
                 snprintf(dml, sizeof(dml),
                          "INSERT INTO mqtt_pub.dead_letters "
@@ -488,11 +541,11 @@ drain_outbox(void)
                          new_attempts,
                          h ? pgmqttpub_shared->broker_states[h->broker_idx].last_error
                            : "broker not found",
-                         (long)id);
+                         (long)messages[i].id);
                 SPI_execute(dml, false, 0);
 
                 snprintf(dml, sizeof(dml),
-                         "DELETE FROM mqtt_pub.outbox WHERE id = %ld", (long)id);
+                         "DELETE FROM mqtt_pub.outbox WHERE id = %ld", (long)messages[i].id);
                 SPI_execute(dml, false, 0);
 
                 pg_atomic_fetch_sub_u64(&pgmqttpub_shared->outbox_pending, 1);
@@ -500,17 +553,17 @@ drain_outbox(void)
 
                 if (h)
                 {
-                    bs = &pgmqttpub_shared->broker_states[h->broker_idx];
+                    PgMqttPubBrokerState *bs = &pgmqttpub_shared->broker_states[h->broker_idx];
                     bs->messages_dead_lettered++;
                 }
 
                 elog(WARNING, "pg_mqtt_pub: dead-lettered message id=%ld "
                      "topic='%s' after %d attempts",
-                     (long)id, topic, new_attempts);
+                     (long)messages[i].id, messages[i].topic, new_attempts);
             }
             else
             {
-                /* ── Retry with exponential backoff ── */
+                /* Retry with exponential backoff */
                 int  backoff_ms;
                 char dml[256];
 
@@ -523,15 +576,21 @@ drain_outbox(void)
                          "SET attempts = %d, "
                          "    next_retry_at = now() + interval '%d milliseconds' "
                          "WHERE id = %ld",
-                         new_attempts, backoff_ms, (long)id);
+                         new_attempts, backoff_ms, (long)messages[i].id);
                 SPI_execute(dml, false, 0);
             }
         }
+
+        SPI_finish();
+        PopActiveSnapshot();
+        CommitTransactionCommand();
     }
 
-    SPI_finish();
-    PopActiveSnapshot();
-    CommitTransactionCommand();
+    /* Switch back to original context and clean up drain context.
+     * This automatically frees ALL memory allocated within drain_context,
+     * including the messages array and any other allocations. */
+    MemoryContextSwitchTo(oldctx);
+    MemoryContextReset(drain_context);
 
     return published;
 }
@@ -609,8 +668,8 @@ pgmqttpub_worker_main(Datum main_arg)
      */
     PG_TRY();
     {
-    BackgroundWorkerInitializeConnection(pgmqttpub_outbox_database, NULL, 0);
-}
+        BackgroundWorkerInitializeConnection(pgmqttpub_outbox_database, NULL, 0);
+    }
     PG_CATCH();
     {
         /* Database doesn't exist yet or other connection error - we'll retry later */
@@ -633,7 +692,7 @@ pgmqttpub_worker_main(Datum main_arg)
             proc_exit(1);
         }
     }
-
+    
     pgmqttpub_shared->worker_running = true;
     pgmqttpub_shared->worker_pid = MyProcPid;
 
