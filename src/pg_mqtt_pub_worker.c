@@ -603,9 +603,22 @@ pgmqttpub_worker_main(Datum main_arg)
     pqsignal(SIGTERM, pgmqttpub_sigterm_handler);
     BackgroundWorkerUnblockSignals();
 
-    /* Connect to the database for SPI (outbox access) */
-    /* Use POSTGRES_DB environment variable or default to "postgres" */
-    BackgroundWorkerInitializeConnection("testdb", NULL, 0);
+    /* Connect to the configured outbox database for SPI access
+     * If the database doesn't exist yet (e.g., during initial startup),
+     * we'll retry on the next iteration. Don't fail fatally.
+     */
+    PG_TRY();
+    {
+    BackgroundWorkerInitializeConnection(pgmqttpub_outbox_database, NULL, 0);
+}
+    PG_CATCH();
+    {
+        /* Database doesn't exist yet or other connection error - we'll retry later */
+        FlushErrorState();
+        /* Exit gracefully so we can retry */
+        return;
+    }
+    PG_END_TRY();
 
     /* Attach shared memory */
     if (!pgmqttpub_shared)

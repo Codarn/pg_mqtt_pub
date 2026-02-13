@@ -57,6 +57,7 @@ int   pgmqttpub_worker_poll_interval_ms = 10;
 int   pgmqttpub_poison_max_attempts     = PGMQTTPUB_POISON_MAX_ATTEMPTS_DEFAULT;
 int   pgmqttpub_outbox_batch_size       = PGMQTTPUB_OUTBOX_BATCH_SIZE_DEFAULT;
 int   pgmqttpub_dead_letter_retain_days = PGMQTTPUB_DEAD_LETTER_RETAIN_DAYS_DEFAULT;
+char *pgmqttpub_outbox_database         = "postgres";
 
 /* Shmem hooks */
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -272,13 +273,15 @@ pgmqttpub_outbox_insert(const char *broker_name, const char *topic,
     int  ret;
     bool was_connected;
 
-    ret = SPI_connect();
-    was_connected = (ret == SPI_ERROR_CONNECT);  /* true if already connected */
-
-    if (!was_connected && ret != SPI_OK_CONNECT)
+    was_connected = SPI_connect() == SPI_OK_CONNECT;
+    if (!was_connected)
     {
-        elog(WARNING, "pg_mqtt_pub: SPI_connect failed for outbox insert");
-        return false;
+        ret = SPI_connect();
+        if (ret != SPI_OK_CONNECT)
+        {
+            elog(WARNING, "pg_mqtt_pub: SPI_connect failed for outbox insert");
+            return false;
+        }
     }
 
     {
@@ -801,6 +804,11 @@ _PG_init(void)
                             NULL, &pgmqttpub_dead_letter_retain_days,
                             PGMQTTPUB_DEAD_LETTER_RETAIN_DAYS_DEFAULT, 1, 365,
                             PGC_SIGHUP, 0, NULL, NULL, NULL);
+
+    DefineCustomStringVariable("pg_mqtt_pub.outbox_database",
+                               "Database where outbox and dead_letters tables are stored",
+                               NULL, &pgmqttpub_outbox_database, "postgres",
+                               PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
     /* ── Shared Memory Hooks ── */
 

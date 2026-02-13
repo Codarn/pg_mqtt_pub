@@ -138,6 +138,9 @@ typedef struct PgMqttPubSharedState
     pg_atomic_uint64            outbox_pending;      /* approx outbox row count */
     pg_atomic_uint64            total_dead_lettered; /* lifetime dead letter count */
     TimestampTz                 mode_changed_at;     /* last hot↔cold switch */
+
+    /* ── Worker Configuration ── */
+    char                        init_database[64];   /* database where extension is installed */
 } PgMqttPubSharedState;
 
 /* ───────── Global Shared State Pointer ───────── */
@@ -162,6 +165,7 @@ extern int   pgmqttpub_worker_poll_interval_ms;
 extern int   pgmqttpub_poison_max_attempts;
 extern int   pgmqttpub_outbox_batch_size;
 extern int   pgmqttpub_dead_letter_retain_days;
+extern char *pgmqttpub_outbox_database;
 
 /* ───────── Queue Operations (hot path) ───────── */
 
