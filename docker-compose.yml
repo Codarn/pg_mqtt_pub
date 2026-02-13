@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: pg_mqtt_pub_broker
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./test/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck", "-W", "3"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pg_mqtt_pub_postgres
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: testdb
+    ports:
+      - "5432:5432"
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    command: >
+      postgres
+        -c shared_preload_libraries='pg_mqtt_pub,pg_cron'
+        -c pg_mqtt_pub.broker_host=mosquitto
+        -c pg_mqtt_pub.broker_port=1883
+        -c cron.database_name=testdb
+
+  mqtt-monitor:
+    image: eclipse-mosquitto:2
+    container_name: pg_mqtt_pub_monitor
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    entrypoint: mosquitto_sub
+    command: ["-h", "mosquitto", "-t", "#", "-v"]

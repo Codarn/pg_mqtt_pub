@@ -1,0 +1,7 @@
+comment = 'MQTT publish from PostgreSQL with hybrid hot/cold delivery (triggers, pg_cron, SQL)'
+default_version = '1.0'
+module_pathname = '$libdir/pg_mqtt_pub'
+relocatable = false
+schema = mqtt_pub
+requires = ''
+superuser = true
